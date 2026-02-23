@@ -43,7 +43,7 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - WEBHOOK_URL=http://api:8082/capacity-planning/complete
-      - PORT = 8083
+      - PORT=8083
     depends_on:
       redis:
         condition: service_healthy
