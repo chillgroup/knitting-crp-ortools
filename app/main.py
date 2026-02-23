@@ -1,3 +1,4 @@
+import json
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
@@ -18,6 +19,8 @@ class SolverResource(BaseModel):
     capacity: int = 1
     operation: Optional[str] = None
     unavailability: List[TimeWindow] = Field(default_factory=list)
+    design_item_id: str = ""
+    color_config: str = ""
 
 class MachineRoute(BaseModel):
     operation: str
@@ -31,6 +34,8 @@ class Machine(BaseModel):
     type: Optional[str] = None
     worker_req: int = 1
     routing: List[MachineRoute]
+    design_item_id: str
+    color_config: str
 
 class SolverTask(BaseModel):
     task_id: str = Field(alias="task_id")
@@ -52,6 +57,7 @@ class SolverTask(BaseModel):
     is_batch: bool = Field(default=False, alias="is_batch")
     sub_tasks: Optional[List['SolverTask']] = Field(default=None, alias="sub_tasks")
     design_item_id: str = Field(alias="design_item_id")
+    color_config: str = Field(alias="color_config")
     compatible_resource_ids: List[str] = Field(default=[], alias="compatible_resource_ids")
     sub_task_completion_offsets: Optional[Dict[str, int]] = Field(default=None, alias="sub_task_completion_offsets")
     class Config:
@@ -72,6 +78,11 @@ class SolverPayload(BaseModel):
 @app.post("/api/v1/solve")
 async def create_solve_task(payload: SolverPayload):
     """Queue optimization task to Celery"""
+    # Debug: check SK11 in resources
+    for r in payload.resources:
+        if r.id == "SK11":
+            print(f"🐍 MAIN.PY: SK11 Resource -> design_item_id='{r.design_item_id}', color_config='{r.color_config}'")
+    
     task = optimize_schedule.delay(payload.model_dump(by_alias=False))
     
     return {

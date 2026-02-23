@@ -1,442 +1,249 @@
 from ortools.sat.python import cp_model
-from typing import Dict, List, Any
-import sys
-
-# Safe buffer time (minutes) between dependent tasks
-BUFFER_TIME = 0 
-# Heavy penalty for dropping tasks (to force the Solver to schedule them)
-DROP_PENALTY = 1000000 
+from typing import Dict, Any, List
+import json
 
 class Engine:
+
+
     def __init__(self, payload: Dict[str, Any]):
-        self.config = payload.get("config", {})
-        self.resources = payload.get("resources", []) 
+        # 1. Parse Config (keep for using other parameters)
+        import json
+        self.config = {}
+        print("📥 Parsing config from payload...", payload)
+        raw_config = payload.get("config", "{}")
+        if isinstance(raw_config, str):
+            try:
+                self.config = json.loads(raw_config)
+            except:
+                self.config = {}
+        else:
+            self.config = raw_config
+
+        # 2. [FINALIZED] Read Machines from Payload Root (As confirmed by forensic log)
+        machines_data = payload.get("machines", []) 
+        
+        # DEBUG: Print ALL machines raw data
+        print(f"📦 RECEIVED {len(machines_data)} MACHINES FROM PAYLOAD")
+        for m in machines_data:
+            if m.get("id") == "SK11":
+                print(f"🔍 SK11 RAW DATA: {json.dumps(m, indent=2)}")
+        
+        # Map data
+        self.machine_states = {}
+        for m in machines_data:
+            m_id = m.get("id")
+            if m_id:
+                # After fixing Go, these 2 fields will appear
+                self.machine_states[m_id] = {
+                    "current_design": m.get("design_item_id", ""),
+                    "current_color": m.get("color_config", "")
+                }
+
+        # 3. Debug to see if Design exists (Hopefully will see it this time)
+        if "SK11" in self.machine_states:
+            st = self.machine_states["SK11"]
+            print(f"🎯 SK11 in machine_states -> Design: '{st['current_design']}' | Color: '{st['current_color']}'")
+        
+        # Init Resources & Tasks
+        self.resources = payload.get("resources", [])
         self.tasks = payload.get("tasks", [])
         
+        # Debug resources
+        for r in self.resources:
+            if r.get("id") == "SK11":
+                print(f"🎯 SK11 in resources -> Design: '{r.get('design_item_id', '')}' | Color: '{r.get('color_config', '')}'")
+
         self.model = cp_model.CpModel()
         self.solver = cp_model.CpSolver()
-        print(f"Engine initialized with {len(self.tasks)} tasks and {len(self.resources)} resources.")
 
     def solve(self) -> Dict[str, Any]:
         if not self.tasks:
-            return {"status": "feasible", "assignments": []}
+            return {"status": "feasible", "assignments": [], "overloads": []}
 
-        # --- STEP 0: DIAGNOSE INPUT DATA (Find the cause of Infeasible first) ---
-        self._diagnose_input_issues()
+        # Setup Horizon
+        total_duration = sum(int(t.get("duration", 0)) for t in self.tasks)
+        config_horizon = int(self.config.get("horizon_minutes", 40320))
+        horizon = max(config_horizon, total_duration + 5000)
 
-        print("\n🕵️ DIAGNOSING DROPPED BATCHES:")
+        # Configure penalty points
+        # Heavy penalty if changing Design (because changing mold takes longer than changing thread)
+        SETUP_DESIGN_PENALTY = 500 
+        # Light penalty if changing Color (same mold, only changing thread)
+        SETUP_COLOR_PENALTY = 100  
+
         resource_map = {r["id"]: r for r in self.resources}
-        
-        # Only check tasks that are in the dropped list
-        target_ids = ['BATCH_0-646_1', 'BATCH_0-646_2'] # ID you see in the log
-
-        for t in self.tasks:
-            if t.get("task_id") not in target_ids: continue
-            
-            print(f"\n>> ANALYZING {t.get('task_id')}:")
-            
-            # 1. Check Duration
-            duration = int(t.get("duration") or 0)
-            print(f"   - Duration Required: {duration} mins")
-            
-            # 2. Check Resources
-            comp_res = t.get("compatible_resource_ids") or []
-            print(f"   - Compatible Resources: {comp_res}")
-            
-            if not comp_res:
-                print("   ❌ ERROR: No compatible resources found! Check Mapping Logic.")
-                continue
-
-            # 3. Check Slot on each machine
-            for r_id in comp_res:
-                if r_id not in resource_map: continue
-                res = resource_map[r_id]
-                windows = res.get("unavailability", [])
-                
-                # Calculate Max Gap
-                sorted_windows = sorted(windows, key=lambda x: int(x['start']))
-                current_time = 0
-                max_gap = 0
-                
-                print(f"   - Machine {r_id} Breaks:")
-                for w in sorted_windows:
-                    start, end = int(w['start']), int(w['end'])
-                    gap = start - current_time
-                    if gap > max_gap: max_gap = gap
-                    print(f"     [{current_time} -> {start}] (Gap: {gap}m) | Break: {start}->{end}")
-                    current_time = end
-                
-                # Check the last segment
-                gap = 100000 - current_time
-                if gap > max_gap: max_gap = gap
-                
-                print(f"   => Max Continuous Slot on {r_id}: {max_gap} mins")
-                
-                if duration > max_gap:
-                    print(f"   ❌ FAIL: Task duration ({duration}) > Max Slot ({max_gap})")
-                else:
-                    print(f"   ✅ PASS: Task fits in slot!")
-        # ---------------------------------------------------------------------
-
-        # --- STEP 1: BUILD MODEL ---
-        task_vars = self._build_model()
-        
-        # --- STEP 2: CONFIGURE SOLVER ---
-        max_time = int(self.config.get("max_search_time", 60))
-        self.solver.parameters.max_time_in_seconds = max_time
-        self.solver.parameters.log_search_progress = True 
-        # self.solver.parameters.linearization_level = 2 # Uncomment to debug deeper if needed
-
-        print("🚀 Solving...")
-        status = self.solver.Solve(self.model)
-        print(f"🏁 Solver Status: {self.solver.StatusName(status)}")
-
-        # --- STEP 3: RESULT ---
-        if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-            self._analyze_overlaps(task_vars)
-            assignments, overloads = self._extract_solution(task_vars)
-            return {
-                "status": "feasible",
-                "objective_value": int(self.solver.ObjectiveValue()),
-                "assignments": assignments,
-                "overloads": overloads
-            }
-        else:
-            print("❌ MODEL IS INFEASIBLE. Please check the Diagnosis logs above.")
-            return {
-                "status": "infeasible",
-                "assignments": [],
-                "overloads": []
-            }
-
-    def _build_model(self):
         task_vars = {}
-        
-        resource_map = {r["id"]: r for r in self.resources}
-        resource_intervals = {r["id"]: [] for r in self.resources}
-        resource_demands = {r["id"]: [] for r in self.resources}
-        
-        # Automatically calculate Horizon if config is too small
-        total_duration = sum(int(t.get("duration") or 0) for t in self.tasks)
-        config_horizon = int(self.config.get("horizon_minutes", 100000))
-        horizon = max(config_horizon, total_duration + 10080) # Minimum is 1 extra week
+        objective_terms = []
 
         # ---------------------------------------------------------
-        # 1. BUILD UNAVAILABILITY INTERVALS (DUMMY TASKS)
-        # ---------------------------------------------------------
-        resource_unavail_intervals = {}
-        for r in self.resources:
-            r_id = r["id"]
-            unavail_list = []
-            
-            for window in r.get("unavailability", []):
-                start = int(window["start"]) # Force int
-                end = int(window["end"])     # Force int
-                size = end - start
-                if size > 0:
-                    # Create Fixed Interval to block break times
-                    ival = self.model.NewFixedSizeIntervalVar(start, size, f"Unavail_{r_id}_{start}")
-                    unavail_list.append(ival)
-            
-            resource_unavail_intervals[r_id] = unavail_list
-
-        # ---------------------------------------------------------
-        # 2. BUILD TASKS VARIABLES
+        # BUILD MODEL
         # ---------------------------------------------------------
         for t in self.tasks:
-            t_id = t.get("task_id") or t.get("TaskID")
-            if not t_id: continue
-
-            start_var = self.model.NewIntVar(0, horizon, f"{t_id}_start")
-            end_var = self.model.NewIntVar(0, horizon, f"{t_id}_end")
+            t_id = t["task_id"]
+            duration = int(t["duration"])
+            priority = int(t.get("priority", 5))
+            due_at = int(t.get("due_at_min", horizon))
+            start_after = int(t.get("start_after_min", 0))
             
-            # Start After Constraint
-            start_after = int(t.get("start_after_min") or t.get("StartAfterMin") or 0)
+            # Get Task characteristics
+            task_design = t.get("design_item_id", "")
+            task_color = t.get("color_config", "") # Example: "RED", "BLUE"
+
+            # A. Time variables
+            start_var = self.model.NewIntVar(0, horizon, f"start_{t_id}")
+            end_var = self.model.NewIntVar(0, horizon, f"end_{t_id}")
+            self.model.NewIntervalVar(start_var, duration, end_var, f"interval_{t_id}")
+            self.model.Add(end_var == start_var + duration)
             if start_after > 0:
                 self.model.Add(start_var >= start_after)
 
+            # B. Select machine
             literals = []
-            r_ids = []
+            compatible_ids = t.get("compatible_resource_ids", [])
             
-            # [SOFT CONSTRAINT] Variable allowing task drop if it cannot be scheduled
-            is_dropped = self.model.NewBoolVar(f"{t_id}_dropped")
-            
-            compatible_ids = t.get("compatible_resource_ids") or t.get("CompatibleResourceIDs") or []
-            
+            if not compatible_ids:
+                print(f"⚠️ Task {t_id} has NO compatible resources.")
+                continue
+
             for r_id in compatible_ids:
                 if r_id not in resource_map: continue
                 
                 is_selected = self.model.NewBoolVar(f"{t_id}_on_{r_id}")
                 literals.append(is_selected)
-                r_ids.append(r_id)
-
-                # [FIX] Force int for duration
-                duration = int(t.get("duration") or t.get("Duration") or 0)
                 
-                # Optional Interval: Only active if this machine is selected
-                interval = self.model.NewOptionalIntervalVar(
-                    start_var, duration, end_var, is_selected, f"Int_{t_id}_{r_id}"
+                # Create Interval
+                opt_interval = self.model.NewOptionalIntervalVar(
+                    start_var, duration, end_var, is_selected, f"int_{t_id}_{r_id}"
                 )
-                resource_intervals[r_id].append(interval)
+                if "intervals" not in resource_map[r_id]:
+                    resource_map[r_id]["intervals"] = []
+                resource_map[r_id]["intervals"].append(opt_interval)
+
+# --- [NEW LOGIC V2] SETUP AFFINITY (COMPATIBILITY) ---
+                # Read current machine state from resource
+                curr_resource = resource_map[r_id]
+                curr_design = curr_resource.get("design_item_id", "")
+                curr_color = curr_resource.get("color_config", "")
+
+                penalty_score = 0
                 
-                # Demand Logic
-                is_batch = t.get("is_batch") or t.get("IsBatch")
-                qty_raw = t.get("qty") or t.get("Qty") or 1
-                demand = int(qty_raw) if is_batch else 1
-                resource_demands[r_id].append(demand)
+                # Configure penalty points
+                PENALTY_CHANGE_DESIGN = 500  # Must remove old mold and install new one
+                PENALTY_COLD_START    = 200  # Machine is idle, must install mold from scratch
+                PENALTY_CHANGE_COLOR  = 100  # Same mold, but must change thread
+                PENALTY_SETUP_COLOR   = 50   # Machine has no thread color, must thread it
 
-            # [IMPORTANT] Machine selection constraint: Choose 1 machine OR be Dropped
-            if literals:
-                self.model.AddExactlyOne(literals + [is_dropped])
-            else:
-                # No compatible machine -> Forced to Drop
-                self.model.Add(is_dropped == 1)
+                # 1. CHECK DESIGN
+                if task_design:
+                    if curr_design == task_design:
+                        # ✅ MATCH: No penalty
+                        pass
+                    elif curr_design == "":
+                        # ⚠️ COLD START: Machine is idle -> Light penalty due to setup cost
+                        penalty_score += PENALTY_COLD_START
+                    else:
+                        # ❌ MISMATCH: Machine running different design -> Heavy penalty
+                        penalty_score += PENALTY_CHANGE_DESIGN
 
-            # Store info
-            prio_val = int(t.get("priority") or t.get("Priority") or 3)
-            due_val = int(t.get("due_at_min") or t.get("DueAtMin") or horizon)
+                # 2. CHECK COLOR
+                if task_color:
+                    if curr_color == task_color:
+                        # ✅ MATCH: No penalty
+                        pass
+                    elif curr_color == "":
+                         # ⚠️ SETUP COLOR: Machine has no thread -> Very light penalty
+                        penalty_score += PENALTY_SETUP_COLOR
+                    else:
+                        # ❌ MISMATCH: Machine running different color -> Penalty for thread change
+                        penalty_score += PENALTY_CHANGE_COLOR
+                
+                # Add penalty to objective function
+                if penalty_score > 0:
+                    objective_terms.append(is_selected * penalty_score)
 
+            self.model.AddExactlyOne(literals)
+
+            # C. Main Objective Function
+            weight = 10 ** (6 - priority)
+            lateness = self.model.NewIntVar(0, horizon, f"lat_{t_id}")
+            self.model.Add(lateness >= end_var - due_at)
+            
+            objective_terms.append(lateness * weight * 100) # Priority 1: No delays
+            objective_terms.append(start_var)               # Priority 2: Start early
+
+            # Store Vars
             task_vars[t_id] = {
                 "start": start_var,
                 "end": end_var,
                 "literals": literals,
-                "is_dropped": is_dropped, # Save drop variable
-                "r_ids": r_ids,
-                "due": due_val,      
-                "priority": prio_val, 
-                
-                "depends_on": t.get("final_depends_on") or t.get("FinalDependsOn") or [],
-                "internal_dep": t.get("internal_dep") or t.get("InternalDep"),
-                
-                "original_order_id": t.get("original_order_id") or t.get("OriginalOrderID"),
-                "sub_task_completion_offsets": t.get("sub_task_completion_offsets") or t.get("SubTaskCompletionOffsets") or {}
+                "r_ids": compatible_ids,
+                "due": due_at,
+                "original_order_id": t.get("original_order_id", ""),
+                "group_id": t.get("group_id", ""),
+                "depends_on": t.get("final_depends_on", []),
+                "qty": t.get("qty", 0)
             }
 
         # ---------------------------------------------------------
-        # 3. APPLY RESOURCE CONSTRAINTS
+        # CONSTRAINTS & SOLVE
         # ---------------------------------------------------------
-        for r_id, r in resource_map.items():
-            intervals = resource_intervals[r_id]
-            unavail_intervals = resource_unavail_intervals.get(r_id, [])
-            all_intervals = intervals + unavail_intervals
-            
-            if not all_intervals: continue
-            
-            if r.get("type") == "batch" or r.get("operation") == "washing":
-                # Cumulative Constraint (Washing Machine)
-                machine_capacity = int(r.get("capacity", 100))
-                task_demands = resource_demands[r_id]
-                
-                # Break time must occupy full capacity to block
-                unavail_demands = [machine_capacity] * len(unavail_intervals)
-                
-                self.model.AddCumulative(
-                    all_intervals, 
-                    task_demands + unavail_demands, 
-                    machine_capacity
-                )
-            else:
-                # No Overlap Constraint (Regular Machine)
-                self.model.AddNoOverlap(all_intervals)
+        for r_id, res in resource_map.items():
+            intervals = res.get("intervals", [])
+            for window in res.get("unavailability", []):
+                start, end = int(window["start"]), int(window["end"])
+                if end > start:
+                    unavail = self.model.NewFixedSizeIntervalVar(start, end-start, f"unavail_{r_id}")
+                    intervals.append(unavail)
+            if intervals:
+                self.model.AddNoOverlap(intervals)
 
-        # ---------------------------------------------------------
-        # 4. APPLY DEPENDENCY CONSTRAINTS
-        # ---------------------------------------------------------
         for t_id, tv in task_vars.items():
-            # Only apply dependency if task is NOT dropped (Enforce if not dropped)
-            # However in CP-SAT, start/end variable of optional interval is disabled undefined
-            # So we just add a simple constraint, if dropped the constraint is still valid because start/end are free
-            
-            # A. General Dependencies
             for parent_id in tv["depends_on"]:
-                if parent_id not in task_vars: continue
-                parent_tv = task_vars[parent_id]
-                
-                offsets = parent_tv["sub_task_completion_offsets"]
-                child_order_id = tv["original_order_id"]
+                if parent_id in task_vars:
+                    self.model.Add(tv["start"] >= task_vars[parent_id]["end"])
 
-                # Interleaved Batching Logic
-                if offsets and child_order_id and child_order_id in offsets:
-                    lag_minutes = int(offsets[child_order_id]) 
-                    self.model.Add(
-                        tv["start"] >= parent_tv["start"] + lag_minutes + BUFFER_TIME
-                    )
-                else:
-                    self.model.Add(
-                        tv["start"] >= parent_tv["end"] + BUFFER_TIME
-                    )
-
-            # B. Internal Slice Dependencies
-            prev_id = tv["internal_dep"]
-            if prev_id and prev_id in task_vars:
-                prev_tv = task_vars[prev_id]
-                self.model.Add(tv["start"] >= prev_tv["end"])
-                
-                # Constraint that slices of the same task must be on the same machine (if not dropped)
-                for i, lit in enumerate(tv["literals"]):
-                    r_id = tv["r_ids"][i]
-                    if r_id in prev_tv["r_ids"]:
-                        idx_prev = prev_tv["r_ids"].index(r_id)
-                        # lit == prev_lit
-                        self.model.Add(lit == prev_tv["literals"][idx_prev])
-
-        # ---------------------------------------------------------
-        # 5. OBJECTIVE FUNCTION
-        # ---------------------------------------------------------
-        makespan = self.model.NewIntVar(0, horizon, "makespan")
-        objective_terms = []
-        
-        # A. Penalty for Dropped Tasks (Highest priority: Minimize Drops)
-        for _, tv in task_vars.items():
-            objective_terms.append(tv["is_dropped"] * DROP_PENALTY)
-        
-        # B. Minimize Makespan
-        for _, tv in task_vars.items():
-            self.model.Add(makespan >= tv["end"])
-        objective_terms.append(makespan * 100)
-        
-        # C. Minimize Lateness
-        for _, tv in task_vars.items():
-            if tv["due"] < horizon:
-                delay = self.model.NewIntVar(0, horizon, f"delay")
-                self.model.Add(delay >= tv["end"] - tv["due"])
-                
-                prio = tv["priority"]
-                weight = int((6 - prio) * 1000) 
-                objective_terms.append(delay * weight)
-            
         self.model.Minimize(sum(objective_terms))
-        return task_vars
-
-    def _extract_solution(self, task_vars):
+        self.solver.parameters.max_time_in_seconds = int(self.config.get("max_search_time", 60))
+        self.solver.parameters.relative_gap_limit = 0.01 # Stop early if already optimal
+        
+        status = self.solver.Solve(self.model)
+        
         assignments = []
         overloads = []
 
-        for t_id, tv in task_vars.items():
-            # 1. Check if Task is Dropped
-            if self.solver.Value(tv["is_dropped"]) == 1:
-                overloads.append({
-                    "task_id": t_id,
-                    "order_id": tv.get("original_order_id", ""),
-                    "status": "DROPPED",
-                    "delay_minutes": 0,
-                    "root_cause_code": self._determine_drop_cause(t_id, tv),
-                    "bottleneck_resource_id": ""
-                })
-                continue
-
-            # 2. Task is successfully assigned
-            start_val = self.solver.Value(tv["start"])
-            end_val = self.solver.Value(tv["end"])
-            
-            selected_res = None
-            for i, lit in enumerate(tv["literals"]):
-                if self.solver.Value(lit) == 1:
-                    selected_res = tv["r_ids"][i]
-                    break
-            
-            if selected_res:
-                assignments.append({
-                    "task_id": t_id,
-                    "machine_id": selected_res,
-                    "start_min": start_val,
-                    "end_min": end_val,
-                    "order_id": tv.get("original_order_id", "")
-                })
-
-                # Check if task is LATE
-                due_min = tv.get("due", 0)
-                if due_min > 0 and end_val > due_min:
-                    overloads.append({
+        if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+            print(f"✅ Feasible! Obj: {self.solver.ObjectiveValue()}")
+            for t_id, tv in task_vars.items():
+                start_val = self.solver.Value(tv["start"])
+                end_val = self.solver.Value(tv["end"])
+                selected_res = None
+                for i, lit in enumerate(tv["literals"]):
+                    if self.solver.Value(lit) == 1:
+                        selected_res = tv["r_ids"][i]
+                        break
+                
+                if selected_res:
+                    assignments.append({
                         "task_id": t_id,
+                        "machine_id": selected_res,
+                        "start_time": start_val,
+                        "end_time": end_val,
+                        "group_id": tv.get("group_id", ""),
                         "order_id": tv.get("original_order_id", ""),
-                        "status": "LATE",
-                        "delay_minutes": end_val - due_min,
-                        "root_cause_code": "CAPACITY_FULL",
-                        "bottleneck_resource_id": selected_res
+                        "quantity": tv.get("qty", 0),
+                        "status": "ON_TIME" if end_val <= tv["due"] else "LATE"
                     })
-        
-        if overloads:
-            dropped_count = sum(1 for o in overloads if o["status"] == "DROPPED")
-            late_count = sum(1 for o in overloads if o["status"] == "LATE")
-            print(f"\n⚠️  OVERLOAD SUMMARY: {dropped_count} DROPPED, {late_count} LATE")
-            if dropped_count > 0:
-                dropped_ids = [o["task_id"] for o in overloads if o["status"] == "DROPPED"][:10]
-                print(f"    -> Dropped: {dropped_ids} ...")
 
-        return assignments, overloads
-
-    def _determine_drop_cause(self, t_id: str, tv: dict) -> str:
-        """Determine why a task was dropped"""
-        if not tv.get("literals"):
-            return "NO_COMPATIBLE_RESOURCE"
-        return "SLOT_TOO_SMALL_OR_CAPACITY_FULL"
-
-    def _diagnose_input_issues(self):
-        """Preliminary check to see if any task is impossible from the start"""
-        print("\n--- DIAGNOSING INPUT DATA ---")
-        resource_map = {r["id"]: r for r in self.resources}
-        
-        issues_found = False
-        for t in self.tasks:
-            duration = int(t.get("duration") or 0)
-            compatible_ids = t.get("compatible_resource_ids") or []
-            
-            if not compatible_ids:
-                print(f"❌ Task '{t.get('task_id')}' has NO compatible resources!")
-                issues_found = True
-                continue
-
-            max_slot_found = 0
-            # Find the largest gap on compatible machines
-            for r_id in compatible_ids:
-                if r_id not in resource_map: continue
-                res = resource_map[r_id]
-                windows = res.get("unavailability", [])
-                
-                # Tính max gap
-                current_time = 0
-                local_max = 0
-                sorted_windows = sorted(windows, key=lambda x: int(x['start']))
-                
-                for w in sorted_windows:
-                    w_start = int(w['start'])
-                    gap = w_start - current_time
-                    if gap > local_max: local_max = gap
-                    current_time = int(w['end'])
-                
-                # Check the last segment to infinity (assumed horizon 1 week)
-                gap = 10080 - current_time 
-                if gap > local_max: local_max = gap
-                
-                if local_max > max_slot_found: max_slot_found = local_max
-            
-            if duration > max_slot_found:
-                print(f"⚠️  Task '{t.get('task_id')}' duration ({duration}m) > Max Slot ({max_slot_found}m). It will likely be DROPPED.")
-                issues_found = True
-        
-        if not issues_found:
-            print("✅ Input diagnosis passed. No obvious impossible tasks.")
-        print("-----------------------------\n")
-
-    def _analyze_overlaps(self, task_vars):
-        resource_map = {r["id"]: r for r in self.resources}
-        for t_id, tv in task_vars.items():
-            if self.solver.Value(tv["is_dropped"]) == 1: continue
-
-            start = self.solver.Value(tv["start"])
-            end = self.solver.Value(tv["end"])
-            
-            selected_res = None
-            for i, lit in enumerate(tv["literals"]):
-                if self.solver.Value(lit) == 1:
-                    selected_res = tv["r_ids"][i]
-                    break
-            
-            if selected_res:
-                windows = resource_map[selected_res].get("unavailability", [])
-                for w in windows:
-                    w_start = int(w["start"])
-                    w_end = int(w["end"])
-                    if max(start, w_start) < min(end, w_end):
-                        print(f"❌ LOGIC ERROR: Task {t_id} overlaps break on {selected_res}")
+                    if end_val > tv["due"]:
+                        overloads.append({
+                            "task_id": t_id,
+                            "order_id": tv.get("original_order_id", ""),
+                            "status": "LATE",
+                            "delay_minutes": end_val - tv["due"],
+                            "root_cause_code": "CAPACITY_FULL",
+                            "bottleneck_resource_id": selected_res,
+                            "quantity": tv.get("qty", 0)
+                        })
+            return {"status": "feasible", "assignments": assignments, "overloads": overloads}
+        else:
+            return {"status": "infeasible", "assignments": [], "overloads": []}

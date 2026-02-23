@@ -7,8 +7,8 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "http://backend:8082/api/webhook/solver")
 
 def filter_dummy_tasks(assignments):
     """
-    Filter out tasks that have task ID starting with 'DUMMY_' or operation as 'Unavailability'
-    before returning to the Backend.
+    Filter out tasks with IDs starting with 'DUMMY_' or operation 'Unavailability'
+    before returning to Backend.
     """
     if not assignments:
         return []
@@ -25,8 +25,8 @@ def filter_dummy_tasks(assignments):
 
 def filter_dummy_overloads(overloads):
     """
-    Filter out overloads that have task ID starting with 'DUMMY_' or operation as 'Unavailability'
-    before returning to the Backend.
+    Filter out overloads with task IDs starting with 'DUMMY_' or operation 'Unavailability'
+    before returning to Backend.
     """
     if not overloads:
         return []
@@ -45,6 +45,8 @@ def filter_dummy_overloads(overloads):
 def optimize_schedule(self, payload: dict):
     try:
         print(f"[Task {self.request.id}] Starting...")
+
+        print(f"[Task {self.request.id}] Payload received: {payload}")
 
         engine = Engine(payload)
         result = engine.solve()
