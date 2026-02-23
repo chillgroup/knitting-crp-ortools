@@ -15,4 +15,4 @@ COPY . .
 
 EXPOSE $PORT
 
-CMD ["sh", "-c", "uvicorn cp_app.main:app --host ${HOST} --port ${PORT}"]
+CMD ["sh", "-c", "uvicorn app.main:app --host ${HOST} --port ${PORT}"]

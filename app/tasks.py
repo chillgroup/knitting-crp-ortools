@@ -7,8 +7,8 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "http://backend:8082/api/webhook/solver")
 
 def filter_dummy_tasks(assignments):
     """
-    Lọc bỏ các task có ID bắt đầu bằng 'DUMMY_' hoặc operation là 'Unavailability'
-    trước khi trả về cho Backend.
+    Filter out tasks that have task ID starting with 'DUMMY_' or operation as 'Unavailability'
+    before returning to the Backend.
     """
     if not assignments:
         return []
@@ -25,8 +25,8 @@ def filter_dummy_tasks(assignments):
 
 def filter_dummy_overloads(overloads):
     """
-    Lọc bỏ các overload có task ID bắt đầu bằng 'DUMMY_' hoặc operation là 'Unavailability'
-    trước khi trả về cho Backend.
+    Filter out overloads that have task ID starting with 'DUMMY_' or operation as 'Unavailability'
+    before returning to the Backend.
     """
     if not overloads:
         return []

@@ -7,7 +7,7 @@ celery_app = Celery(
     "solver_worker",
     broker=REDIS_URL,
     backend=REDIS_URL,
-    include=['cp_app.tasks']  # Import tasks module
+    include=['app.tasks']  # Import tasks module
 )
 
 celery_app.conf.update(

@@ -1,1 +1,4 @@
 venv/
+.env
+AI_GUIDELINES.md
+__pycache__

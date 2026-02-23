@@ -2,9 +2,9 @@ from ortools.sat.python import cp_model
 from typing import Dict, List, Any
 import sys
 
-# Buffer time (phút) an toàn giữa các task phụ thuộc
+# Safe buffer time (minutes) between dependent tasks
 BUFFER_TIME = 0 
-# Phạt nặng nếu bỏ qua task (để Solver cố gắng xếp bằng được)
+# Heavy penalty for dropping tasks (to force the Solver to schedule them)
 DROP_PENALTY = 1000000 
 
 class Engine:
@@ -21,14 +21,14 @@ class Engine:
         if not self.tasks:
             return {"status": "feasible", "assignments": []}
 
-        # --- STEP 0: DIAGNOSE INPUT DATA (Tìm nguyên nhân Infeasible trước) ---
+        # --- STEP 0: DIAGNOSE INPUT DATA (Find the cause of Infeasible first) ---
         self._diagnose_input_issues()
 
         print("\n🕵️ DIAGNOSING DROPPED BATCHES:")
         resource_map = {r["id"]: r for r in self.resources}
         
-        # Chỉ check các task có trong danh sách bị drop
-        target_ids = ['BATCH_0-646_1', 'BATCH_0-646_2'] # ID bạn thấy trong log
+        # Only check tasks that are in the dropped list
+        target_ids = ['BATCH_0-646_1', 'BATCH_0-646_2'] # ID you see in the log
 
         for t in self.tasks:
             if t.get("task_id") not in target_ids: continue
@@ -47,13 +47,13 @@ class Engine:
                 print("   ❌ ERROR: No compatible resources found! Check Mapping Logic.")
                 continue
 
-            # 3. Check Slot trên từng máy
+            # 3. Check Slot on each machine
             for r_id in comp_res:
                 if r_id not in resource_map: continue
                 res = resource_map[r_id]
                 windows = res.get("unavailability", [])
                 
-                # Tính Max Gap
+                # Calculate Max Gap
                 sorted_windows = sorted(windows, key=lambda x: int(x['start']))
                 current_time = 0
                 max_gap = 0
@@ -66,7 +66,7 @@ class Engine:
                     print(f"     [{current_time} -> {start}] (Gap: {gap}m) | Break: {start}->{end}")
                     current_time = end
                 
-                # Check đoạn cuối
+                # Check the last segment
                 gap = 100000 - current_time
                 if gap > max_gap: max_gap = gap
                 
@@ -85,7 +85,7 @@ class Engine:
         max_time = int(self.config.get("max_search_time", 60))
         self.solver.parameters.max_time_in_seconds = max_time
         self.solver.parameters.log_search_progress = True 
-        # self.solver.parameters.linearization_level = 2 # Uncomment để debug sâu hơn nếu cần
+        # self.solver.parameters.linearization_level = 2 # Uncomment to debug deeper if needed
 
         print("🚀 Solving...")
         status = self.solver.Solve(self.model)
@@ -116,10 +116,10 @@ class Engine:
         resource_intervals = {r["id"]: [] for r in self.resources}
         resource_demands = {r["id"]: [] for r in self.resources}
         
-        # Tự động tính Horizon nếu config quá bé
+        # Automatically calculate Horizon if config is too small
         total_duration = sum(int(t.get("duration") or 0) for t in self.tasks)
         config_horizon = int(self.config.get("horizon_minutes", 100000))
-        horizon = max(config_horizon, total_duration + 10080) # Min là 1 tuần dư ra
+        horizon = max(config_horizon, total_duration + 10080) # Minimum is 1 extra week
 
         # ---------------------------------------------------------
         # 1. BUILD UNAVAILABILITY INTERVALS (DUMMY TASKS)
@@ -134,7 +134,7 @@ class Engine:
                 end = int(window["end"])     # Force int
                 size = end - start
                 if size > 0:
-                    # Tạo Fixed Interval chặn giờ nghỉ
+                    # Create Fixed Interval to block break times
                     ival = self.model.NewFixedSizeIntervalVar(start, size, f"Unavail_{r_id}_{start}")
                     unavail_list.append(ival)
             
@@ -158,7 +158,7 @@ class Engine:
             literals = []
             r_ids = []
             
-            # [SOFT CONSTRAINT] Biến cho phép Drop task nếu không thể xếp lịch
+            # [SOFT CONSTRAINT] Variable allowing task drop if it cannot be scheduled
             is_dropped = self.model.NewBoolVar(f"{t_id}_dropped")
             
             compatible_ids = t.get("compatible_resource_ids") or t.get("CompatibleResourceIDs") or []
@@ -170,26 +170,26 @@ class Engine:
                 literals.append(is_selected)
                 r_ids.append(r_id)
 
-                # [FIX] Force int cho duration
+                # [FIX] Force int for duration
                 duration = int(t.get("duration") or t.get("Duration") or 0)
                 
-                # Interval Optional: Chỉ active nếu chọn máy này
+                # Optional Interval: Only active if this machine is selected
                 interval = self.model.NewOptionalIntervalVar(
                     start_var, duration, end_var, is_selected, f"Int_{t_id}_{r_id}"
                 )
                 resource_intervals[r_id].append(interval)
                 
-                # Logic Demand
+                # Demand Logic
                 is_batch = t.get("is_batch") or t.get("IsBatch")
                 qty_raw = t.get("qty") or t.get("Qty") or 1
                 demand = int(qty_raw) if is_batch else 1
                 resource_demands[r_id].append(demand)
 
-            # [QUAN TRỌNG] Ràng buộc chọn máy: Chọn 1 máy HOẶC bị Drop
+            # [IMPORTANT] Machine selection constraint: Choose 1 machine OR be Dropped
             if literals:
                 self.model.AddExactlyOne(literals + [is_dropped])
             else:
-                # Không có máy nào tương thích -> Buộc phải Drop
+                # No compatible machine -> Forced to Drop
                 self.model.Add(is_dropped == 1)
 
             # Store info
@@ -200,7 +200,7 @@ class Engine:
                 "start": start_var,
                 "end": end_var,
                 "literals": literals,
-                "is_dropped": is_dropped, # Lưu biến drop
+                "is_dropped": is_dropped, # Save drop variable
                 "r_ids": r_ids,
                 "due": due_val,      
                 "priority": prio_val, 
@@ -223,11 +223,11 @@ class Engine:
             if not all_intervals: continue
             
             if r.get("type") == "batch" or r.get("operation") == "washing":
-                # Cumulative Constraint (Máy giặt)
+                # Cumulative Constraint (Washing Machine)
                 machine_capacity = int(r.get("capacity", 100))
                 task_demands = resource_demands[r_id]
                 
-                # Giờ nghỉ phải chiếm toàn bộ capacity để chặn
+                # Break time must occupy full capacity to block
                 unavail_demands = [machine_capacity] * len(unavail_intervals)
                 
                 self.model.AddCumulative(
@@ -236,16 +236,16 @@ class Engine:
                     machine_capacity
                 )
             else:
-                # No Overlap Constraint (Máy thường)
+                # No Overlap Constraint (Regular Machine)
                 self.model.AddNoOverlap(all_intervals)
 
         # ---------------------------------------------------------
         # 4. APPLY DEPENDENCY CONSTRAINTS
         # ---------------------------------------------------------
         for t_id, tv in task_vars.items():
-            # Chỉ áp dụng dependency nếu task KHÔNG bị drop (Enforce if not dropped)
-            # Tuy nhiên trong CP-SAT, biến start/end của optional interval bị disable không xác định
-            # Nên ta chỉ add constraint đơn giản, nếu drop thì constraint vẫn đúng vì start/end tự do
+            # Only apply dependency if task is NOT dropped (Enforce if not dropped)
+            # However in CP-SAT, start/end variable of optional interval is disabled undefined
+            # So we just add a simple constraint, if dropped the constraint is still valid because start/end are free
             
             # A. General Dependencies
             for parent_id in tv["depends_on"]:
@@ -255,7 +255,7 @@ class Engine:
                 offsets = parent_tv["sub_task_completion_offsets"]
                 child_order_id = tv["original_order_id"]
 
-                # Logic Interleaved Batching
+                # Interleaved Batching Logic
                 if offsets and child_order_id and child_order_id in offsets:
                     lag_minutes = int(offsets[child_order_id]) 
                     self.model.Add(
@@ -272,7 +272,7 @@ class Engine:
                 prev_tv = task_vars[prev_id]
                 self.model.Add(tv["start"] >= prev_tv["end"])
                 
-                # Ràng buộc slice cùng task phải cùng máy (nếu không bị drop)
+                # Constraint that slices of the same task must be on the same machine (if not dropped)
                 for i, lit in enumerate(tv["literals"]):
                     r_id = tv["r_ids"][i]
                     if r_id in prev_tv["r_ids"]:
@@ -286,7 +286,7 @@ class Engine:
         makespan = self.model.NewIntVar(0, horizon, "makespan")
         objective_terms = []
         
-        # A. Penalty for Dropped Tasks (Ưu tiên cao nhất: Hạn chế Drop)
+        # A. Penalty for Dropped Tasks (Highest priority: Minimize Drops)
         for _, tv in task_vars.items():
             objective_terms.append(tv["is_dropped"] * DROP_PENALTY)
         
@@ -373,7 +373,7 @@ class Engine:
         return "SLOT_TOO_SMALL_OR_CAPACITY_FULL"
 
     def _diagnose_input_issues(self):
-        """Kiểm tra sơ bộ xem có task nào bất khả thi ngay từ đầu không"""
+        """Preliminary check to see if any task is impossible from the start"""
         print("\n--- DIAGNOSING INPUT DATA ---")
         resource_map = {r["id"]: r for r in self.resources}
         
@@ -388,7 +388,7 @@ class Engine:
                 continue
 
             max_slot_found = 0
-            # Tìm khoảng trống lớn nhất trên các máy tương thích
+            # Find the largest gap on compatible machines
             for r_id in compatible_ids:
                 if r_id not in resource_map: continue
                 res = resource_map[r_id]
@@ -405,7 +405,7 @@ class Engine:
                     if gap > local_max: local_max = gap
                     current_time = int(w['end'])
                 
-                # Check đoạn cuối đến vô cực (horizon giả định 1 tuần)
+                # Check the last segment to infinity (assumed horizon 1 week)
                 gap = 10080 - current_time 
                 if gap > local_max: local_max = gap
                 
