@@ -77,15 +77,6 @@ class Engine:
             .define_objective()
         )
 
-        logger.info(
-            f"\n📋 TASKS IN MODEL ({len(builder.task_vars)}): "
-            f"{sorted(builder.task_vars.keys())}"
-        )
-        logger.info("🗺  TRANSLATION MAP (non-identity entries):")
-        for k, v in builder.task_translation_map.items():
-            if k != v:
-                logger.info(f"   {k} -> {v}")
-
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = int(self.config.get("max_search_time", 60))
         # Stop early when the gap to the proven lower-bound is ≤ 1 %

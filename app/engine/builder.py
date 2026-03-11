@@ -155,7 +155,7 @@ class TaskModelBuilder:
             self.model.Add(lateness >= end_var - due_at)
             self.objective_terms.append(lateness * weight * 100)
             # Secondary objective: prefer earlier starts (tie-breaking)
-            self.objective_terms.append(start_var)
+            # self.objective_terms.append(start_var)
 
             self.task_vars[t_id] = {
                 "start": start_var,
