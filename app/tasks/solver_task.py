@@ -41,6 +41,8 @@ def optimize_schedule(self, payload: dict):
             f"assignments={len(clean_assignments)}, overloads={len(clean_overloads)}"
         )
 
+        logger.info(f"[Assignments]: {clean_assignments}")
+
         resp = requests.post(WEBHOOK_URL, json=response_data, timeout=10)
         if resp.status_code == 200:
             logger.info("✅ Callback successful")

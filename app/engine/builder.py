@@ -181,7 +181,13 @@ class TaskModelBuilder:
         enforce that a machine handles at most one task at a time.
         Affinity penalties are added to the objective to guide the solver toward
         machines that are already set up for the same design/color.
+        NEW: Adds a heavy penalty for activating a new resource to minimize workforce.
         """
+        # Dictionary to track which Boolean variables (literals) are assigned to each resource
+        resource_usage_literals: Dict[str, List[cp_model.IntVar]] = {
+            r_id: [] for r_id in self.resource_map.keys()
+        }
+
         for t in self.tasks:
             t_id = t["task_id"]
             if t_id not in self.task_vars:
@@ -202,6 +208,14 @@ class TaskModelBuilder:
                 is_selected = self.model.NewBoolVar(f"{t_id}_on_{r_id}")
                 literals.append(is_selected)
 
+                available_at = int(self.resource_map[r_id].get("available_at_min", 0))
+                # print(f"Resource {r_id} available at {available_at} min")
+                if available_at > 0:
+                    self.model.Add(start_var >= available_at).OnlyEnforceIf(is_selected)
+                
+                # Track this literal for the resource activation penalty
+                resource_usage_literals[r_id].append(is_selected)
+
                 opt_interval = self.model.NewOptionalIntervalVar(
                     start_var, duration, end_var, is_selected, f"int_{t_id}_{r_id}"
                 )
@@ -218,6 +232,25 @@ class TaskModelBuilder:
             # Exactly one resource must be selected for every scheduled task
             self.model.AddExactlyOne(literals)
             tv["literals"] = literals
+
+        # ------------------------------------------------------------------
+        # NEW: Resource Activation Penalty (Minimize Number of Workers/Machines)
+        # ------------------------------------------------------------------
+        PENALTY_ACTIVATE_RESOURCE = 50000  # Make this very high to prioritize fewer workers
+
+        for r_id, assigned_literals in resource_usage_literals.items():
+            if not assigned_literals:
+                continue # No tasks can even run on this resource
+            
+            # Create a boolean variable that is True IF AND ONLY IF this resource is used
+            is_resource_activated = self.model.NewBoolVar(f"activated_{r_id}")
+            
+            # Constraint: If ANY task is assigned to this resource (literal == 1),
+            # then is_resource_activated MUST be 1.
+            self.model.AddMaxEquality(is_resource_activated, assigned_literals)
+            
+            # Add the massive penalty to the objective function
+            self.objective_terms.append(is_resource_activated * PENALTY_ACTIVATE_RESOURCE)
 
         return self
 
@@ -268,10 +301,9 @@ class TaskModelBuilder:
         tasks_with_offset: Set[str] = {
             t["task_id"]
             for t in self.tasks
-            if t.get("wait_for_batch_task_id")
+            if t.get("wait_offsets") or t.get("WaitOffsets") or t.get("wait_for_batch_task_id") or t.get("WaitForBatchTaskID")
         }
-
-        logger.info("\n🔗 INFERRED K→L DEPENDENCIES (fallback):")
+        print(f"\n🔍 Tasks with batch offsets (will skip inferred K→L constraints): {tasks_with_offset}")
         for l_id, l_tv in self.task_vars.items():
             if l_id in tasks_with_offset:
                 continue
@@ -303,45 +335,40 @@ class TaskModelBuilder:
     def apply_batch_offset_constraints(self) -> "TaskModelBuilder":
         """
         Apply pipelining constraints: a downstream slice (e.g. Linking) can start
-        once the upstream batch (e.g. Knitting) has advanced past a known offset,
-        rather than waiting for the entire batch to finish.
+        once the upstream batch (e.g. Knitting) has advanced past a known offset.
+        Now supports multiple batch dependencies via the 'wait_offsets' dictionary.
 
         Go backend provides:
-            wait_for_batch_task_id — the batch task to wait on
-            wait_for_offset        — minutes into that batch's start when this task may begin
-
-        Constraint: task.start >= batch.start + offset
+            WaitOffsets — dictionary mapping BatchTaskID -> offset in minutes
         """
-        logger.info("\n⏱  BATCH OFFSET CONSTRAINTS (wait_for_batch_task_id):")
+        logger.info("\n⏱  BATCH OFFSET CONSTRAINTS (WaitOffsets):")
         for t in self.tasks:
             t_id = t["task_id"]
             if t_id not in self.task_vars:
                 continue
 
-            wait_batch_id = (
-                t.get("wait_for_batch_task_id")
-                or t.get("WaitForBatchTaskID")
-                or ""
-            )
-            wait_offset = t.get("wait_for_offset") or t.get("WaitForOffset") or 0
+            wait_offsets = t.get("wait_offsets") or t.get("WaitOffsets") or {}
 
-            if not wait_batch_id:
+            if not wait_offsets:
                 continue
 
-            actual_batch = self.task_translation_map.get(wait_batch_id, wait_batch_id)
-            if actual_batch not in self.task_vars:
-                logger.warning(
-                    f"   ⚠️ '{t_id}': wait_for_batch '{wait_batch_id}' "
-                    f"(resolved: '{actual_batch}') not found — skipping."
+            for raw_batch_id, offset in wait_offsets.items():
+                actual_batch = self.task_translation_map.get(raw_batch_id, raw_batch_id)
+                
+                if actual_batch not in self.task_vars:
+                    logger.warning(
+                        f"   ⚠️ '{t_id}': wait_for_batch '{raw_batch_id}' "
+                        f"(resolved: '{actual_batch}') not found — skipping."
+                    )
+                    continue
+
+                offset_val = int(offset)
+                logger.info(f"   ⏱  {t_id} waits for {actual_batch} at offset +{offset_val}")
+                
+                self.model.Add(
+                    self.task_vars[t_id]["start"]
+                    >= self.task_vars[actual_batch]["start"] + offset_val
                 )
-                continue
-
-            offset_val = int(wait_offset)
-            logger.info(f"   ⏱  {t_id} waits for {actual_batch} at offset +{offset_val}")
-            self.model.Add(
-                self.task_vars[t_id]["start"]
-                >= self.task_vars[actual_batch]["start"] + offset_val
-            )
 
         return self
 

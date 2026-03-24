@@ -15,6 +15,7 @@ class SolverResource(BaseModel):
     unavailability: List[TimeWindow] = Field(default_factory=list)
     design_item_id: str = ""
     color_config: str = ""
+    available_at_min: Optional[int] = 0
 
 
 class MachineRoute(BaseModel):
@@ -59,8 +60,9 @@ class SolverTask(BaseModel):
     sub_task_completion_offsets: Optional[Dict[str, int]] = Field(
         default=None, alias="sub_task_completion_offsets"
     )
-    wait_for_batch_task_id: Optional[str] = Field(default=None, alias="wait_for_batch_task_id")
-    wait_for_offset: Optional[int] = Field(default=None, alias="wait_for_offset")
+    # wait_for_batch_task_id: Optional[str] = Field(default=None, alias="wait_for_batch_task_id")
+    # wait_for_offset: Optional[int] = Field(default=None, alias="wait_for_offset")
+    wait_offsets: Optional[Dict[str, int]] = Field(default=None, alias="WaitOffsets")
 
     class Config:
         populate_by_name = True
