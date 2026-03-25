@@ -141,26 +141,37 @@ class TaskModelBuilder:
             start_after = int(t.get("start_after_min", 0))
             deps = t.get("final_depends_on") or []
 
-            start_var = self.model.NewIntVar(0, self.horizon, f"start_{t_id}")
-            end_var = self.model.NewIntVar(0, self.horizon, f"end_{t_id}")
-            self.model.NewIntervalVar(start_var, duration, end_var, f"interval_{t_id}")
-            self.model.Add(end_var == start_var + duration)
+            # NẾU BỊ GHIM (PINNED)
+            if t.get("is_pinned"):
+                start_val = int(t["pinned_start_time"])
+                end_val = int(t["pinned_end_time"])
 
-            if start_after > 0:
-                self.model.Add(start_var >= start_after)
+                # Dùng biến hằng số (Constant), không cho Solver xê dịch
+                start_var = self.model.NewConstant(start_val)
+                end_var = self.model.NewConstant(end_val)
+                
+                # Không cần ép `end_var == start_var + duration` nữa vì nó đã cố định.
 
-            # Weighted lateness: priority 1 tasks carry a much heavier penalty
+            # NẾU LÀ TASK MỚI (TỰ DO)
+            else:
+                start_var = self.model.NewIntVar(0, self.horizon, f"start_{t_id}")
+                end_var = self.model.NewIntVar(0, self.horizon, f"end_{t_id}")
+                # Chỉ ép duration cho biến tự do
+                self.model.Add(end_var == start_var + duration)
+                
+                if start_after > 0:
+                    self.model.Add(start_var >= start_after)
+
+            # Weighted lateness
             weight = 10 ** (6 - priority)
             lateness = self.model.NewIntVar(0, self.horizon, f"lat_{t_id}")
             self.model.Add(lateness >= end_var - due_at)
             self.objective_terms.append(lateness * weight * 100)
-            # Secondary objective: prefer earlier starts (tie-breaking)
-            # self.objective_terms.append(start_var)
 
             self.task_vars[t_id] = {
                 "start": start_var,
                 "end": end_var,
-                "literals": [],        # populated in build_resource_allocations
+                "literals": [],        
                 "r_ids": compatible_ids,
                 "due": due_at,
                 "original_order_id": t.get("original_order_id", ""),
@@ -175,15 +186,6 @@ class TaskModelBuilder:
         return self
 
     def build_resource_allocations(self) -> "TaskModelBuilder":
-        """
-        For each task, create one Boolean selection variable per compatible resource.
-        Optional interval variables hang off those Booleans so AddNoOverlap can
-        enforce that a machine handles at most one task at a time.
-        Affinity penalties are added to the objective to guide the solver toward
-        machines that are already set up for the same design/color.
-        NEW: Adds a heavy penalty for activating a new resource to minimize workforce.
-        """
-        # Dictionary to track which Boolean variables (literals) are assigned to each resource
         resource_usage_literals: Dict[str, List[cp_model.IntVar]] = {
             r_id: [] for r_id in self.resource_map.keys()
         }
@@ -191,65 +193,62 @@ class TaskModelBuilder:
         for t in self.tasks:
             t_id = t["task_id"]
             if t_id not in self.task_vars:
-                continue  # Was skipped in build_time_variables (no compatible resources)
+                continue 
 
             task_design = t.get("design_item_id", "")
             task_color = t.get("color_config", "")
             tv = self.task_vars[t_id]
             start_var = tv["start"]
             end_var = tv["end"]
-            duration = int(t["duration"])
+            
+            # Nếu ghim, chỉ cần ghi đè danh sách r_ids thành 1 máy duy nhất trước khi vào vòng lặp
+            if t.get("is_pinned"):
+                tv["r_ids"] = [t["pinned_machine_id"]]
+
             literals = []
 
             for r_id in tv["r_ids"]:
                 if r_id not in self.resource_map:
                     continue
 
+                # Tạo biến is_selected CHUẨN (Chỉ tạo 1 lần)
                 is_selected = self.model.NewBoolVar(f"{t_id}_on_{r_id}")
                 literals.append(is_selected)
 
+                # NẾU TASK BỊ GHIM -> ÉP BIẾN NÀY = 1
+                if t.get("is_pinned"):
+                    self.model.Add(is_selected == 1)
+
                 available_at = int(self.resource_map[r_id].get("available_at_min", 0))
-                # print(f"Resource {r_id} available at {available_at} min")
                 if available_at > 0:
                     self.model.Add(start_var >= available_at).OnlyEnforceIf(is_selected)
                 
-                # Track this literal for the resource activation penalty
                 resource_usage_literals[r_id].append(is_selected)
 
+                # OptionalIntervalVar dùng cho AddNoOverlap
+                # Cần tính lại duration thực tế nếu đã ghim để tránh lỗi Infeasible
+                actual_duration = int(t.get("pinned_end_time", 0)) - int(t.get("pinned_start_time", 0)) if t.get("is_pinned") else int(t["duration"])
+                
                 opt_interval = self.model.NewOptionalIntervalVar(
-                    start_var, duration, end_var, is_selected, f"int_{t_id}_{r_id}"
+                    start_var, actual_duration, end_var, is_selected, f"int_{t_id}_{r_id}"
                 )
-                # Accumulate intervals per resource for NoOverlap constraint
                 self.resource_map[r_id].setdefault("intervals", []).append(opt_interval)
 
                 penalty = self._compute_affinity_penalty(
                     self.resource_map[r_id], task_design, task_color
                 )
                 if penalty > 0:
-                    # Penalise the objective only when this resource is actually selected
                     self.objective_terms.append(is_selected * penalty)
 
-            # Exactly one resource must be selected for every scheduled task
             self.model.AddExactlyOne(literals)
             tv["literals"] = literals
 
-        # ------------------------------------------------------------------
-        # NEW: Resource Activation Penalty (Minimize Number of Workers/Machines)
-        # ------------------------------------------------------------------
-        PENALTY_ACTIVATE_RESOURCE = 50000  # Make this very high to prioritize fewer workers
-
+        PENALTY_ACTIVATE_RESOURCE = 50000 
         for r_id, assigned_literals in resource_usage_literals.items():
             if not assigned_literals:
-                continue # No tasks can even run on this resource
-            
-            # Create a boolean variable that is True IF AND ONLY IF this resource is used
+                continue 
             is_resource_activated = self.model.NewBoolVar(f"activated_{r_id}")
-            
-            # Constraint: If ANY task is assigned to this resource (literal == 1),
-            # then is_resource_activated MUST be 1.
             self.model.AddMaxEquality(is_resource_activated, assigned_literals)
-            
-            # Add the massive penalty to the objective function
             self.objective_terms.append(is_resource_activated * PENALTY_ACTIVATE_RESOURCE)
 
         return self

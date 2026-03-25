@@ -64,6 +64,11 @@ class SolverTask(BaseModel):
     # wait_for_offset: Optional[int] = Field(default=None, alias="wait_for_offset")
     wait_offsets: Optional[Dict[str, int]] = Field(default=None, alias="WaitOffsets")
 
+    is_pinned: bool = Field(default=False, alias="is_pinned")
+    pinned_machine_id: Optional[str] = Field(default=None, alias="pinned_machine_id")
+    pinned_start_time: Optional[int] = Field(default=None, alias="pinned_start_time")
+    pinned_end_time: Optional[int] = Field(default=None, alias="pinned_end_time")
+
     class Config:
         populate_by_name = True
 
