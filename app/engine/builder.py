@@ -128,6 +128,25 @@ class TaskModelBuilder:
         Tasks with no compatible resources are skipped with a warning so the
         solver never crashes on bad input (defensive programming).
         """
+        # Deduplicate task_ids — Go backend may emit duplicate IDs for split segments.
+        # Duplicate CP-SAT variable names cause silent constraint mis-binding and
+        # double-add NoOverlap intervals on the same machine, making the model INFEASIBLE.
+        seen_task_ids: Set[str] = set()
+        for t in self.tasks:
+            orig = t["task_id"]
+            if orig in seen_task_ids:
+                counter = 2
+                candidate = f"{orig}_dup{counter}"
+                while candidate in seen_task_ids:
+                    counter += 1
+                    candidate = f"{orig}_dup{counter}"
+                t["task_id"] = candidate
+                logger.warning(
+                    f"⚠️ Duplicate task_id '{orig}' renamed → '{t['task_id']}' "
+                    f"(pinned={t.get('is_pinned')}, start={t.get('pinned_start_time')}, end={t.get('pinned_end_time')})"
+                )
+            seen_task_ids.add(t["task_id"])
+
         for t in self.tasks:
             t_id = t["task_id"]
             compatible_ids = t.get("compatible_resource_ids", [])
@@ -142,7 +161,7 @@ class TaskModelBuilder:
             deps = t.get("final_depends_on") or []
 
             # NẾU BỊ GHIM (PINNED)
-            if t.get("is_pinned"):
+            if t.get("is_pinned") and t.get("pinned_start_time") is not None and t.get("pinned_end_time") is not None:
                 start_val = int(t["pinned_start_time"])
                 end_val = int(t["pinned_end_time"])
 
@@ -152,7 +171,7 @@ class TaskModelBuilder:
                 
                 # Không cần ép `end_var == start_var + duration` nữa vì nó đã cố định.
 
-            # NẾU LÀ TASK MỚI (TỰ DO)
+            # NẾU LÀ TASK MỚI (TỰ DO) — hoặc pinned nhưng thiếu thời gian ghim
             else:
                 start_var = self.model.NewIntVar(0, self.horizon, f"start_{t_id}")
                 end_var = self.model.NewIntVar(0, self.horizon, f"end_{t_id}")
@@ -220,14 +239,20 @@ class TaskModelBuilder:
                     self.model.Add(is_selected == 1)
 
                 available_at = int(self.resource_map[r_id].get("available_at_min", 0))
-                if available_at > 0:
+                # Skip available_at for pinned tasks — start_var is a NewConstant;
+                # is_selected is forced to 1, so OnlyEnforceIf has no effect and
+                # available_at > pinned_start would make the model INFEASIBLE.
+                if available_at > 0 and not t.get("is_pinned"):
                     self.model.Add(start_var >= available_at).OnlyEnforceIf(is_selected)
                 
                 resource_usage_literals[r_id].append(is_selected)
 
                 # OptionalIntervalVar dùng cho AddNoOverlap
                 # Cần tính lại duration thực tế nếu đã ghim để tránh lỗi Infeasible
-                actual_duration = int(t.get("pinned_end_time", 0)) - int(t.get("pinned_start_time", 0)) if t.get("is_pinned") else int(t["duration"])
+                pinned_start = t.get("pinned_start_time")
+                pinned_end = t.get("pinned_end_time")
+                is_fully_pinned = t.get("is_pinned") and pinned_start is not None and pinned_end is not None
+                actual_duration = int(pinned_end) - int(pinned_start) if is_fully_pinned else int(t["duration"])
                 
                 opt_interval = self.model.NewOptionalIntervalVar(
                     start_var, actual_duration, end_var, is_selected, f"int_{t_id}_{r_id}"
