@@ -1,4 +1,5 @@
 venv/
 .env
 AI_GUIDELINES.md
+.agents
 __pycache__

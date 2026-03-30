@@ -84,36 +84,72 @@ class TaskModelBuilder:
         self,
         resource: Dict[str, Any],
         task_design: str,
-        task_color: str,
+        task_color_str: str, # Lúc này Go đang gửi chuỗi YarnConfig qua field 'color_config'
     ) -> int:
         """
-        Return the affinity penalty for assigning a task to a resource given its
-        current design/color state.  A higher score means the assignment is less
-        preferred, nudging the solver toward machines that are already set up.
+        Tính toán điểm phạt (penalty) khi gán task vào một máy cụ thể.
+        Điểm càng cao -> Setup càng lâu -> Solver càng né tránh máy này.
         """
         curr_design = resource.get("design_item_id", "")
-        curr_color = resource.get("color_config", "")
+        curr_color_str = resource.get("color_config", "")
         penalty = 0
 
-        if task_design:
-            if curr_design == task_design:
-                pass  # Perfect match — no penalty
-            elif curr_design == "":
-                # Machine is idle; installing a mold from scratch is cheaper than swapping
-                penalty += PENALTY_COLD_START
-            else:
-                # Active machine running a different design — mold swap required
-                penalty += PENALTY_CHANGE_DESIGN
+        # ---------------------------------------------------------
+        # 1. SETUP FILE THIẾT KẾ (Rất nhanh, chỉ cần nạp USB)
+        # ---------------------------------------------------------
+        PENALTY_CHANGE_DESIGN = 10 
+        if task_design and curr_design and curr_design != task_design:
+            penalty += PENALTY_CHANGE_DESIGN
 
-        if task_color:
-            if curr_color == task_color:
-                pass  # Perfect match — no penalty
-            elif curr_color == "":
-                # Machine has no thread loaded yet — very light setup
-                penalty += PENALTY_SETUP_COLOR
-            else:
-                # Thread color must be changed
-                penalty += PENALTY_CHANGE_COLOR
+        # ---------------------------------------------------------
+        # 2. SETUP DÀN CỌC SỢI (Rất lâu, tốn công xỏ dây)
+        # ---------------------------------------------------------
+        PENALTY_COLD_START = 200     # Phạt máy trống, phải lên dàn cọc từ đầu
+        PENALTY_PER_ROLL_SWAP = 100  # Phạt nặng cho MỖI MỘT cuộn sợi phải tháo/lắp
+
+        if not task_color_str:
+            return penalty # Không có thông tin sợi -> Bỏ qua
+
+        if curr_color_str == task_color_str:
+            # Dàn cọc giống HỆT NHAU -> Tuyệt vời, 0 điểm phạt sợi!
+            pass
+            
+        elif curr_color_str == "":
+            # Máy chưa có sợi, tốn công xỏ dây mới hoàn toàn
+            # Đếm tổng số cuộn cần xỏ từ chuỗi (Ví dụ: "MAT_A:2|MAT_B:1" -> 3 cuộn)
+            total_rolls = sum(int(item.split(':')[1]) for item in task_color_str.split('|') if ':' in item)
+            
+            # Xỏ mới từ đầu thường nhanh hơn việc tháo cái cũ ra rồi lắp cái mới vào
+            penalty += PENALTY_COLD_START + (total_rolls * int(PENALTY_PER_ROLL_SWAP / 2))
+            
+        else:
+            # CÓ SỰ LỆCH PHA -> TÍNH TOÁN SỐ CUỘN CẦN THAY THẾ
+            def parse_yarns(y_str: str) -> Dict[str, int]:
+                res = {}
+                if not y_str: return res
+                for item in y_str.split('|'):
+                    if ':' in item:
+                        mat, qty = item.split(':')
+                        res[mat] = int(qty)
+                    else:
+                        res[item] = 1 # Fallback an toàn nếu chuỗi bị lỗi format
+                return res
+
+            # Parse chuỗi thành Dictionary. VD: {'MAT_BLK_05': 1, 'MAT_RED_01': 2}
+            curr_yarns = parse_yarns(curr_color_str)
+            task_yarns = parse_yarns(task_color_str)
+
+            swaps_needed = 0
+            
+            # So sánh Sợi của Task vs Sợi đang cắm trên Máy
+            for mat, target_qty in task_yarns.items():
+                current_qty = curr_yarns.get(mat, 0)
+                if target_qty > current_qty:
+                    # Nếu thiếu bao nhiêu cuộn thì phải mất công chạy đi lấy và xỏ vào
+                    swaps_needed += (target_qty - current_qty)
+            
+            # Cộng dồn hình phạt dựa trên số cuộn phải thao tác
+            penalty += (swaps_needed * PENALTY_PER_ROLL_SWAP)
 
         return penalty
 
