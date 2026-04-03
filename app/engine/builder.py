@@ -305,13 +305,79 @@ class TaskModelBuilder:
             tv["literals"] = literals
 
         PENALTY_ACTIVATE_RESOURCE = 50000 
+        PENALTY_ACTIVATE_LABOR = 0
         for r_id, assigned_literals in resource_usage_literals.items():
             if not assigned_literals:
                 continue 
+            is_labor = r_id.startswith("W_") 
+            
             is_resource_activated = self.model.NewBoolVar(f"activated_{r_id}")
             self.model.AddMaxEquality(is_resource_activated, assigned_literals)
-            self.objective_terms.append(is_resource_activated * PENALTY_ACTIVATE_RESOURCE)
 
+            if is_labor:
+                self.objective_terms.append(is_resource_activated * PENALTY_ACTIVATE_LABOR)
+            else:
+                self.objective_terms.append(is_resource_activated * PENALTY_ACTIVATE_RESOURCE)
+
+        # ------------------------------------------------------------------
+        # NEW: GROUP CHUNKS OF THE SAME PO (SPAN CONTIGUOUS CONSTRAINT)
+        # ------------------------------------------------------------------
+        # 1. Gom nhóm các task Knitting theo Original Order ID
+        po_knitting_groups: Dict[str, List[Dict]] = {}
+        
+        for t in self.tasks:
+            # Lọc riêng khâu Knitting (Bạn có thể điều chỉnh điều kiện if này cho khớp với data của bạn)
+            if t.get("operation", "").lower() == "knitting":
+                po_id = t.get("original_order_id")
+                if po_id:
+                    po_knitting_groups.setdefault(po_id, []).append(t)
+
+        # 2. Tạo ràng buộc cho từng nhóm
+        for po_id, tasks_in_po in po_knitting_groups.items():
+            if len(tasks_in_po) <= 1:
+                continue # Đơn chỉ có 1 task thì không cần ép
+
+            t_ids = [t["task_id"] for t in tasks_in_po]
+            total_duration = sum(int(t["duration"]) for t in tasks_in_po)
+            
+            starts = [self.task_vars[tid]["start"] for tid in t_ids]
+            ends = [self.task_vars[tid]["end"] for tid in t_ids]
+
+            # --- RÀNG BUỘC 1: ÉP KHÔNG CÓ KHE HỞ (CONTIGUOUS) ---
+            min_start = self.model.NewIntVar(0, self.horizon, f"min_start_po_{po_id}")
+            max_end = self.model.NewIntVar(0, self.horizon, f"max_end_po_{po_id}")
+            
+            # min_start = min(tất cả các starts)
+            self.model.AddMinEquality(min_start, starts)
+            # max_end = max(tất cả các ends)
+            self.model.AddMaxEquality(max_end, ends)
+            
+            # Độ rộng từ mẻ đầu đến mẻ cuối BẰNG ĐÚNG tổng thời gian chạy
+            self.model.Add(max_end - min_start == total_duration)
+
+            # --- RÀNG BUỘC 2: ÉP CHẠY CHUNG MỘT MÁY ---
+            first_tid = t_ids[0]
+            first_literals = self.task_vars[first_tid]["literals"]
+            
+            # So sánh các task còn lại với task đầu tiên
+            for i in range(1, len(t_ids)):
+                other_tid = t_ids[i]
+                other_literals = self.task_vars[other_tid]["literals"]
+                
+                # Quét qua toàn bộ máy móc trong xưởng
+                for r_id in self.resource_map.keys():
+                    # Tìm cờ boolean "Task X chạy trên Máy Y"
+                    lit_first = next((l for l in first_literals if l.Name().endswith(f"_on_{r_id}")), None)
+                    lit_other = next((l for l in other_literals if l.Name().endswith(f"_on_{r_id}")), None)
+                    
+                    if lit_first is not None and lit_other is not None:
+                        # Nếu task 1 chọn máy r_id, thì task i cũng PHẢI chọn máy r_id
+                        self.model.Add(lit_first == lit_other)
+                    elif lit_first is not None and lit_other is None:
+                        # Logic phòng hờ: Nếu task i không thể chạy máy này, cấm luôn task 1 chạy máy này
+                        self.model.Add(lit_first == 0)
+                    elif lit_first is None and lit_other is not None:
+                        self.model.Add(lit_other == 0)
         return self
 
     def apply_routing_constraints(self) -> "TaskModelBuilder":
