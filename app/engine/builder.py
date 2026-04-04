@@ -320,64 +320,55 @@ class TaskModelBuilder:
                 self.objective_terms.append(is_resource_activated * PENALTY_ACTIVATE_RESOURCE)
 
         # ------------------------------------------------------------------
-        # NEW: GROUP CHUNKS OF THE SAME PO (SPAN CONTIGUOUS CONSTRAINT)
+        # NEW: CONTIGUOUS ON SAME MACHINE, PARALLEL ACROSS MACHINES
         # ------------------------------------------------------------------
-        # 1. Gom nhóm các task Knitting theo Original Order ID
-        po_knitting_groups: Dict[str, List[Dict]] = {}
-        
+        # 1. Gom nhóm task Knitting theo PO
+        po_knitting_groups = {}
         for t in self.tasks:
-            # Lọc riêng khâu Knitting (Bạn có thể điều chỉnh điều kiện if này cho khớp với data của bạn)
             if t.get("operation", "").lower() == "knitting":
                 po_id = t.get("original_order_id")
                 if po_id:
                     po_knitting_groups.setdefault(po_id, []).append(t)
 
-        # 2. Tạo ràng buộc cho từng nhóm
+        # 2. Tạo "Bounding Box" cục bộ trên từng máy
         for po_id, tasks_in_po in po_knitting_groups.items():
             if len(tasks_in_po) <= 1:
-                continue # Đơn chỉ có 1 task thì không cần ép
+                continue
 
-            t_ids = [t["task_id"] for t in tasks_in_po]
-            total_duration = sum(int(t["duration"]) for t in tasks_in_po)
-            
-            starts = [self.task_vars[tid]["start"] for tid in t_ids]
-            ends = [self.task_vars[tid]["end"] for tid in t_ids]
-
-            # --- RÀNG BUỘC 1: ÉP KHÔNG CÓ KHE HỞ (CONTIGUOUS) ---
-            min_start = self.model.NewIntVar(0, self.horizon, f"min_start_po_{po_id}")
-            max_end = self.model.NewIntVar(0, self.horizon, f"max_end_po_{po_id}")
-            
-            # min_start = min(tất cả các starts)
-            self.model.AddMinEquality(min_start, starts)
-            # max_end = max(tất cả các ends)
-            self.model.AddMaxEquality(max_end, ends)
-            
-            # Độ rộng từ mẻ đầu đến mẻ cuối BẰNG ĐÚNG tổng thời gian chạy
-            self.model.Add(max_end - min_start == total_duration)
-
-            # --- RÀNG BUỘC 2: ÉP CHẠY CHUNG MỘT MÁY ---
-            first_tid = t_ids[0]
-            first_literals = self.task_vars[first_tid]["literals"]
-            
-            # So sánh các task còn lại với task đầu tiên
-            for i in range(1, len(t_ids)):
-                other_tid = t_ids[i]
-                other_literals = self.task_vars[other_tid]["literals"]
+            for r_id in self.resource_map.keys():
+                task_lits = []
+                task_durations = []
+                task_starts = []
+                task_ends = []
                 
-                # Quét qua toàn bộ máy móc trong xưởng
-                for r_id in self.resource_map.keys():
-                    # Tìm cờ boolean "Task X chạy trên Máy Y"
-                    lit_first = next((l for l in first_literals if l.Name().endswith(f"_on_{r_id}")), None)
-                    lit_other = next((l for l in other_literals if l.Name().endswith(f"_on_{r_id}")), None)
+                # Lọc các biến (variables) của PO này trên máy r_id
+                for t in tasks_in_po:
+                    tid = t["task_id"]
+                    tv = self.task_vars[tid]
+                    lit = next((l for l in tv["literals"] if l.Name().endswith(f"_on_{r_id}")), None)
+                    if lit is not None:
+                        task_lits.append(lit)
+                        task_durations.append(int(t["duration"]))
+                        task_starts.append(tv["start"])
+                        task_ends.append(tv["end"])
+
+                if len(task_lits) > 1:
+                    # Tạo biến bao trùm cục bộ
+                    po_start = self.model.NewIntVar(0, self.horizon, f"po_{po_id}_{r_id}_start")
+                    po_end = self.model.NewIntVar(0, self.horizon, f"po_{po_id}_{r_id}_end")
+                    po_active = self.model.NewBoolVar(f"po_{po_id}_{r_id}_active")
                     
-                    if lit_first is not None and lit_other is not None:
-                        # Nếu task 1 chọn máy r_id, thì task i cũng PHẢI chọn máy r_id
-                        self.model.Add(lit_first == lit_other)
-                    elif lit_first is not None and lit_other is None:
-                        # Logic phòng hờ: Nếu task i không thể chạy máy này, cấm luôn task 1 chạy máy này
-                        self.model.Add(lit_first == 0)
-                    elif lit_first is None and lit_other is not None:
-                        self.model.Add(lit_other == 0)
+                    # Nếu máy này nhận ít nhất 1 task của PO -> po_active = 1
+                    self.model.AddMaxEquality(po_active, task_lits)
+                    
+                    # Ép Start/End của các task được chọn không vượt ra ngoài Bounding Box
+                    for lit, st, en in zip(task_lits, task_starts, task_ends):
+                        self.model.Add(st >= po_start).OnlyEnforceIf(lit)
+                        self.model.Add(en <= po_end).OnlyEnforceIf(lit)
+                    
+                    # Ràng buộc thép: Khoảng cách Box = Tổng thời gian chạy thực tế của các task trên máy này
+                    total_dur_expr = sum(lit * dur for lit, dur in zip(task_lits, task_durations))
+                    self.model.Add(po_end - po_start == total_dur_expr).OnlyEnforceIf(po_active)
         return self
 
     def apply_routing_constraints(self) -> "TaskModelBuilder":
