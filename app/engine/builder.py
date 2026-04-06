@@ -357,7 +357,7 @@ class TaskModelBuilder:
             self.model.AddExactlyOne(literals)
             tv["literals"] = literals
 
-        PENALTY_ACTIVATE_RESOURCE = 50000 
+        PENALTY_ACTIVATE_RESOURCE = 50 
         PENALTY_ACTIVATE_LABOR = 0
         for r_id, assigned_literals in resource_usage_literals.items():
             if not assigned_literals:
