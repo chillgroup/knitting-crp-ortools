@@ -186,7 +186,8 @@ class TaskModelBuilder:
         for t in self.tasks:
             t_id = t["task_id"]
             compatible_ids = t.get("compatible_resource_ids", [])
-            if not compatible_ids:
+            operation = t.get("operation", "").lower()
+            if t.get("operation") != "capacity_block" and not compatible_ids:
                 logger.warning(f"⚠️ Task {t_id} has NO compatible resources — skipping.")
                 continue
 
@@ -195,6 +196,7 @@ class TaskModelBuilder:
             due_at = int(t.get("due_at_min", self.horizon))
             start_after = int(t.get("start_after_min", 0))
             deps = t.get("final_depends_on") or []
+            is_pinned = t.get("is_pinned", False)
 
             # NẾU BỊ GHIM (PINNED)
             if t.get("is_pinned") and t.get("pinned_start_time") is not None and t.get("pinned_end_time") is not None:
@@ -212,10 +214,11 @@ class TaskModelBuilder:
                 start_var = self.model.NewIntVar(0, self.horizon, f"start_{t_id}")
                 end_var = self.model.NewIntVar(0, self.horizon, f"end_{t_id}")
                 # Chỉ ép duration cho biến tự do
-                self.model.Add(end_var == start_var + duration)
-                
-                if start_after > 0:
-                    self.model.Add(start_var >= start_after)
+                if operation != "capacity_block":
+                    if start_after > 0 and not is_pinned:
+                        self.model.Add(start_var >= start_after)
+                    if due_at > 0 and not is_pinned:
+                        self.model.Add(end_var <= due_at)
 
             # Weighted lateness
             weight = 10 ** (6 - priority)
@@ -239,6 +242,52 @@ class TaskModelBuilder:
                 logger.info(f"   📌 {t_id} final_depends_on={deps}")
 
         return self
+    
+    def build_workforce_constraints(self):
+        knitting_intervals = []
+        demands = []
+        
+        # Lấy giới hạn tuyệt đối của xưởng từ data truyền sang (Ví dụ: 100 máy)
+        # Nếu không có, mặc định là 100
+        print(f"\n🔢 MAX_FACTORY_MACHINES from config: {self.config.get('max_factory_machines', 'Not set, defaulting to 100')}")
+        MAX_FACTORY_MACHINES = self.config.get("max_factory_machines", 100) 
+
+        for t_id, tv in self.task_vars.items():
+            # Tìm thông tin task gốc
+            task_info = next((t for t in self.tasks if t["task_id"] == t_id), {})
+            operation = task_info.get("operation", "").lower()
+            duration = int(task_info.get("duration", 0))
+            
+            # 1. NẾU LÀ TASK DỆT THỰC TẾ
+            if operation == "knitting":
+                # Tạo một IntervalVar ghép từ start_var, duration, và end_var
+                interval = self.model.NewIntervalVar(
+                    tv["start"], 
+                    duration, 
+                    tv["end"], 
+                    f"global_interval_{t_id}"
+                )
+                knitting_intervals.append(interval)
+                demands.append(1) # Mỗi mẻ dệt chiếm 1 năng lực (1 máy)
+                
+            # 2. NẾU LÀ GHOST TASK KHÓA NĂNG LỰC
+            elif operation == "capacity_block":
+                # Dummy Task đã bị ghim, tv["start"] và tv["end"] đang là hằng số
+                interval = self.model.NewIntervalVar(
+                    tv["start"], 
+                    duration, 
+                    tv["end"], 
+                    f"global_interval_{t_id}"
+                )
+                knitting_intervals.append(interval)
+                
+                # Lấy số lượng máy cần chặn từ trường demand
+                blocked_demand = int(task_info.get("demand", 0))
+                demands.append(blocked_demand)
+
+        # 3. Add Cumulative Ràng buộc tổng năng lực
+        if knitting_intervals:
+            self.model.AddCumulative(knitting_intervals, demands, MAX_FACTORY_MACHINES)
 
     def build_resource_allocations(self) -> "TaskModelBuilder":
         resource_usage_literals: Dict[str, List[cp_model.IntVar]] = {
@@ -249,6 +298,10 @@ class TaskModelBuilder:
             t_id = t["task_id"]
             if t_id not in self.task_vars:
                 continue 
+            
+            operation = t.get("operation", "").lower()
+            if operation == "capacity_block":
+                continue
 
             task_design = t.get("design_item_id", "")
             task_color = t.get("color_config", "")
@@ -369,6 +422,8 @@ class TaskModelBuilder:
                     # Ràng buộc thép: Khoảng cách Box = Tổng thời gian chạy thực tế của các task trên máy này
                     total_dur_expr = sum(lit * dur for lit, dur in zip(task_lits, task_durations))
                     self.model.Add(po_end - po_start == total_dur_expr).OnlyEnforceIf(po_active)
+        
+        self.build_workforce_constraints()
         return self
 
     def apply_routing_constraints(self) -> "TaskModelBuilder":

@@ -68,6 +68,7 @@ class SolverTask(BaseModel):
     pinned_machine_id: Optional[str] = Field(default=None, alias="pinned_machine_id")
     pinned_start_time: Optional[int] = Field(default=None, alias="pinned_start_time")
     pinned_end_time: Optional[int] = Field(default=None, alias="pinned_end_time")
+    demand: int = Field(default=1, alias="demand")
 
     class Config:
         populate_by_name = True
@@ -77,11 +78,12 @@ class SolverConfig(BaseModel):
     horizon_minutes: int = 57600
     max_search_time: int = 300
     setup_time_minutes: int = 60
+    max_factory_machines: int = 40
 
 
 class SolverPayload(BaseModel):
     job_id: str
-    config: Dict[str, Any]
+    config: SolverConfig
     machines: List[Machine]
     resources: List[SolverResource] = Field(default_factory=list)
     tasks: List[SolverTask]
