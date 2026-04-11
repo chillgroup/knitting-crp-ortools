@@ -81,7 +81,29 @@ class Engine:
         solver.parameters.max_time_in_seconds = int(self.config.get("max_search_time", 60))
         # Stop early when the gap to the proven lower-bound is ≤ 1 %
         solver.parameters.relative_gap_limit = 0.01
-        solver.parameters.num_search_workers = 8
+        # num_search_workers=1 + fixed random_seed → byte-identical output for replay tests
+        # Use num_search_workers=8 (default) in production for speed
+        solver.parameters.num_search_workers = int(self.config.get("num_search_workers", 8))
+        solver.parameters.random_seed = int(self.config.get("random_seed", 42))
 
         status = solver.Solve(builder.model)
+
+        # Overload-ratio diagnostic: warn ops when total knitting demand exceeds 85 %
+        # of available machine-capacity so they can add shifts before lateness compounds.
+        _total_knitting = sum(
+            int(t.get("duration", 0))
+            for t in self.tasks
+            if t.get("operation", "").lower() == "knitting"
+        )
+        _max_machines = int(self.config.get("max_factory_machines", 100))
+        _capacity = _max_machines * builder.horizon
+        if _capacity > 0:
+            _load = _total_knitting / _capacity
+            if _load > 0.85:
+                logger.warning(
+                    f"🏭 Factory load {_load:.1%} exceeds 85 % "
+                    f"({_total_knitting} knitting-min / {_capacity} available-min). "
+                    "Consider extending shifts or adding machines."
+                )
+
         return builder.extract_results(solver, status)

@@ -58,6 +58,11 @@ class TaskModelBuilder:
         config_horizon = int(self.config.get("horizon_minutes", 40320))
         self.horizon: int = max(config_horizon, total_duration + 5000)
 
+        # Dynamic weight calibration — keeps LATENESS : AFFINITY : ACTIVATION ≈ 1000 : 10 : 2
+        # regardless of horizon size. Larger horizons need a bigger absolute coefficient so that
+        # a 1-minute delay doesn't appear negligible relative to the huge time scale.
+        self.lateness_scale: int = max(1, self.horizon // 1000)
+
         # Build the sub-task → batch-task translation map once during construction
         self.task_translation_map: Dict[str, str] = {}
         self._build_translation_map()
@@ -217,14 +222,12 @@ class TaskModelBuilder:
                 if operation != "capacity_block":
                     if start_after > 0 and not is_pinned:
                         self.model.Add(start_var >= start_after)
-                    if due_at > 0 and not is_pinned:
-                        self.model.Add(end_var <= due_at)
 
             # Weighted lateness
             weight = 10 ** (6 - priority)
             lateness = self.model.NewIntVar(0, self.horizon, f"lat_{t_id}")
             self.model.Add(lateness >= end_var - due_at)
-            self.objective_terms.append(lateness * weight * 100)
+            self.objective_terms.append(lateness * weight * 1000 * self.lateness_scale)
 
             self.task_vars[t_id] = {
                 "start": start_var,
@@ -250,7 +253,18 @@ class TaskModelBuilder:
         # Lấy giới hạn tuyệt đối của xưởng từ data truyền sang (Ví dụ: 100 máy)
         # Nếu không có, mặc định là 100
         print(f"\n🔢 MAX_FACTORY_MACHINES from config: {self.config.get('max_factory_machines', 'Not set, defaulting to 100')}")
-        MAX_FACTORY_MACHINES = self.config.get("max_factory_machines", 100) 
+        MAX_FACTORY_MACHINES = self.config.get("max_factory_machines", 100)
+
+        # Ghost-task count guard: each capacity_block adds a fixed interval to AddCumulative.
+        # Beyond 200 the cumulative propagator slows noticeably; log early so ops can split shifts.
+        _ghost_count = sum(
+            1 for t in self.tasks if t.get("operation", "").lower() == "capacity_block"
+        )
+        if _ghost_count > 200:
+            logger.warning(
+                f"⚠️ capacity_block count={_ghost_count} exceeds 200 — "
+                "AddCumulative propagation may slow. Consider splitting shift windows."
+            )
 
         for t_id, tv in self.task_vars.items():
             # Tìm thông tin task gốc
@@ -264,7 +278,7 @@ class TaskModelBuilder:
                 interval = self.model.NewIntervalVar(
                     tv["start"], 
                     duration, 
-                    tv["end"], 
+                    tv["end"],      
                     f"global_interval_{t_id}"
                 )
                 knitting_intervals.append(interval)
@@ -352,25 +366,24 @@ class TaskModelBuilder:
                     self.resource_map[r_id], task_design, task_color
                 )
                 if penalty > 0:
-                    self.objective_terms.append(is_selected * penalty)
+                    self.objective_terms.append(is_selected * penalty * 10 * self.lateness_scale)
 
             self.model.AddExactlyOne(literals)
             tv["literals"] = literals
 
-        PENALTY_ACTIVATE_RESOURCE = 50 
-        PENALTY_ACTIVATE_LABOR = 0
+        # Activation weights scale with lateness_scale to preserve LATENESS : ACTIVATION ≈ 1000 : 2.
+        # Labor activation is a pure tie-breaker — keep it zero.
+        _w_activate = 2 * self.lateness_scale
         for r_id, assigned_literals in resource_usage_literals.items():
             if not assigned_literals:
-                continue 
-            is_labor = r_id.startswith("W_") 
-            
+                continue
+            is_labor = r_id.startswith("W_")
+
             is_resource_activated = self.model.NewBoolVar(f"activated_{r_id}")
             self.model.AddMaxEquality(is_resource_activated, assigned_literals)
 
-            if is_labor:
-                self.objective_terms.append(is_resource_activated * PENALTY_ACTIVATE_LABOR)
-            else:
-                self.objective_terms.append(is_resource_activated * PENALTY_ACTIVATE_RESOURCE)
+            if not is_labor:
+                self.objective_terms.append(is_resource_activated * _w_activate)
 
         # ------------------------------------------------------------------
         # NEW: CONTIGUOUS ON SAME MACHINE, PARALLEL ACROSS MACHINES
@@ -555,6 +568,92 @@ class TaskModelBuilder:
         return self
 
     # ------------------------------------------------------------------
+    # Post-solve diagnostics
+    # ------------------------------------------------------------------
+
+    def _classify_root_cause(
+        self,
+        t_id: str,
+        selected_res: str,
+        start_val: int,
+        solver: cp_model.CpSolver,
+    ) -> str:
+        """
+        Heuristic post-solve classifier: why did this task end up LATE?
+
+        Priority order (first match wins):
+          1. PINNED_TASK_CONFLICT  — a locked task on the same machine displaced us
+          2. WORKFORCE_SHORTAGE    — global factory cap was saturated at our deadline
+          3. MACHINE_OVERLOAD      — at least one other task competed for this machine
+          4. CAPACITY_FULL         — fallback / unclassified
+
+        Called only after a FEASIBLE/OPTIMAL solve, so solver.Value() is safe.
+        O(n) per late task — acceptable at MVP scale (< 1000 tasks).
+        """
+        # The "desired" start is the earliest the task was allowed to begin.
+        # Using this (rather than start_val) lets us check what blocked an
+        # on-time start, not just what was concurrent at the actual start.
+        task_info = next((t for t in self.tasks if t["task_id"] == t_id), {})
+        desired_start = int(task_info.get("start_after_min", 0))
+
+        # ── 1. PINNED_TASK_CONFLICT ────────────────────────────────────────
+        # A locked task started before us AND was still running at our earliest
+        # possible start, proving it displaced us into a late slot.
+        for t in self.tasks:
+            if (
+                t.get("is_pinned")
+                and t.get("pinned_machine_id") == selected_res
+                and t["task_id"] != t_id
+            ):
+                ps = t.get("pinned_start_time") or 0
+                pe = t.get("pinned_end_time") or 0
+                if ps < start_val and pe > desired_start:
+                    return "PINNED_TASK_CONFLICT"
+
+        # ── 2. WORKFORCE_SHORTAGE ─────────────────────────────────────────
+        # Check whether the factory was already at cap at our desired start time.
+        # If so, we couldn't have started on time even on a free machine.
+        config_max = int(self.config.get("max_factory_machines", 100))
+        concurrent_knitting = 0
+        blocked_demand = 0
+
+        for other_id, other_tv in self.task_vars.items():
+            if other_id == t_id:
+                continue
+            other_start = solver.Value(other_tv["start"])
+            other_end   = solver.Value(other_tv["end"])
+            if other_start <= desired_start < other_end:   # running at our desired start
+                other_info = next(
+                    (t for t in self.tasks if t["task_id"] == other_id), {}
+                )
+                op = other_info.get("operation", "").lower()
+                if op == "knitting":
+                    concurrent_knitting += 1
+                elif op == "capacity_block":
+                    blocked_demand += int(other_info.get("demand", 0))
+
+        if (concurrent_knitting + blocked_demand) >= config_max:
+            return "WORKFORCE_SHORTAGE"
+
+        # ── 3. MACHINE_OVERLOAD ───────────────────────────────────────────
+        # Another task ran on this machine and finished at or before our start —
+        # it directly occupied the slot before us, pushing our start past due_at.
+        for other_id, other_tv in self.task_vars.items():
+            if other_id == t_id:
+                continue
+            if not other_tv.get("literals"):
+                continue
+            other_on_res = any(
+                solver.Value(lit) == 1
+                for lit in other_tv["literals"]
+                if lit.Name().endswith(f"_on_{selected_res}")
+            )
+            if other_on_res and solver.Value(other_tv["end"]) <= start_val:
+                return "MACHINE_OVERLOAD"
+
+        return "CAPACITY_FULL"
+
+    # ------------------------------------------------------------------
     # Result extraction
     # ------------------------------------------------------------------
 
@@ -600,7 +699,9 @@ class TaskModelBuilder:
                         "order_id": tv.get("original_order_id", ""),
                         "status": "LATE",
                         "delay_minutes": end_val - tv["due"],
-                        "root_cause_code": "CAPACITY_FULL",
+                        "root_cause_code": self._classify_root_cause(
+                            t_id, selected_res, start_val, solver
+                        ),
                         "bottleneck_resource_id": selected_res,
                         "quantity": tv.get("qty", 0),
                     })

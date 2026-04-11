@@ -6,3 +6,8 @@ __pycache__
 .claude
 .github
 templates
+part1-deepresearch.md
+part2-prd-mvp.md
+part3-tech-design-mvp.md
+part4-notes-for-agent.md
+logs

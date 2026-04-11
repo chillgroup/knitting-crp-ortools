@@ -36,11 +36,14 @@ uvicorn app.main:app --host 0.0.0.0 --port 8083 --reload
 # Start worker (dev)
 celery -A app.core.celery_app worker --loglevel=info --concurrency=1
 
-# Run tests
-pytest tests/ -v
+# Run tests (use venv Python)
+/home/anya/anya/crp-ortools/env/bin/python -m pytest tests/ -v
+
+# Skip slow 200-task tests
+/home/anya/anya/crp-ortools/env/bin/python -m pytest tests/ -v -m "not slow"
 
 # Run with coverage
-pytest tests/ --cov=app --cov-report=term-missing
+/home/anya/anya/crp-ortools/env/bin/python -m pytest tests/ --cov=app --cov-report=term-missing
 
 # Lint
 ruff check app/ tests/

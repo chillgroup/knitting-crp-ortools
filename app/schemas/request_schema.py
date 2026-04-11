@@ -79,6 +79,8 @@ class SolverConfig(BaseModel):
     max_search_time: int = 300
     setup_time_minutes: int = 60
     max_factory_machines: int = 40
+    random_seed: int = 42       # Fixed seed for deterministic output across runs
+    num_search_workers: int = 8  # Set to 1 for byte-identical replay; 8 for production speed
 
 
 class SolverPayload(BaseModel):
