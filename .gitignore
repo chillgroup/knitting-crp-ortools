@@ -3,3 +3,6 @@ venv/
 AI_GUIDELINES.md
 .agents
 __pycache__
+.claude
+.github
+templates
